@@ -26,10 +26,10 @@
 #include <vector>
 
 size_t max_buffer = 16 * 1024 * 1024;
-size_t min_buffer = 4 * 1024;
+size_t min_buffer = 8 * 1024 * 1024;
 size_t max_size = 1024 * 1024 * 1024; // 128MB
 
-
+#define MEM_COPY_ALL (1)
 int host_to_ssd(int& nvmeFd,
                     cl::Context context,
                     cl::CommandQueue q,
@@ -39,45 +39,7 @@ int host_to_ssd(int& nvmeFd,
     int ret = 0;
     size_t vector_size_bytes = sizeof(int) * max_buffer;
 
-    cl::Kernel krnl;
-    // Allocate Buffer in Global Memory
-
-    OCL_CHECK(err, cl::Buffer input_a(context, CL_MEM_READ_ONLY, vector_size_bytes, nullptr, &err));
-    OCL_CHECK(err,
-              cl::Buffer Bo(context, CL_MEM_WRITE_ONLY, vector_size_bytes, nullptr, &err));
-    OCL_CHECK(err, krnl = cl::Kernel(program, "bandwidth", &err));
-
-    int* inputPtr = (int*)q.enqueueMapBuffer(input_a, CL_TRUE, CL_MAP_WRITE | CL_MAP_READ, 0, vector_size_bytes,
-                                             nullptr, nullptr, &err);
-
-    for (uint32_t i = 0; i < max_buffer; i++) {
-        inputPtr[i] = source_input_A[i];
-    }
-    q.finish();
-
-    // Set the Kernel Arguments
-    OCL_CHECK(err, err = krnl.setArg(0, input_a));
-    OCL_CHECK(err, err = krnl.setArg(1, Bo));
-    OCL_CHECK(err, err = krnl.setArg(2, max_buffer));
-
-    // Copy input data to device global memory
-    OCL_CHECK(err, err = q.enqueueMigrateMemObjects({input_a}, 0 /* 0 means from host*/));
-    OCL_CHECK(err, err = q.enqueueMigrateMemObjects({Bo}, 0 /* 0 means from host*/));
-    q.finish();
-
-    // Launch the Kernel
-    OCL_CHECK(err, err = q.enqueueTask(krnl));
-    q.finish();
-
-    std::cout << "\nMap device buffers to host access pointers\n" << std::endl;
-    void* BoPtr = q.enqueueMapBuffer(Bo,                      // buffer
-                                      CL_TRUE,                    // blocking call
-                                      CL_MAP_WRITE | CL_MAP_READ, // Indicates we will be writing
-                                      0,                          // buffer offset
-                                      vector_size_bytes,          // size in bytes
-                                      nullptr, nullptr,
-                                      &err); // error code
-    q.finish();
+    OCL_CHECK(err, cl::Buffer Bo(context, CL_MEM_WRITE_ONLY, max_size, nullptr, &err));
 
     std::cout << "Start Write of various buffer sizes from SSD to device buffers\n" << std::endl;
     for (size_t bufsize = min_buffer; bufsize <= vector_size_bytes; bufsize *= 2) {
@@ -87,22 +49,34 @@ int host_to_ssd(int& nvmeFd,
         if (xcl::is_emulation()) {
             iter = 2; // Reducing iteration to run faster in emulation flow.
         }
+	char* hb = (char*)aligned_alloc(4096, max_size);
         std::chrono::high_resolution_clock::time_point p2pStart = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < iter; i++) {
-            ret = pread(nvmeFd, (void*)BoPtr, bufsize, 0);
+
+	for (int i = 0; i < iter; i++) {
+	    int offset = i * bufsize;
+            ret = pread(nvmeFd, (void*)(hb + offset), bufsize, offset);
             if (ret == -1) {
                 std::cout << "P2P: read() failed, err: " << ret << ", line: " << __LINE__ << std::endl;
                 return EXIT_FAILURE;
             }
+#if MEM_COPY_ALL == 0
+	    q.enqueueWriteBuffer(Bo, 0, offset, bufsize, hb + offset);
+    	    q.finish();
+#endif
         }
+#if MEM_COPY_ALL == 1
+	q.enqueueWriteBuffer(Bo, 0, 0, max_size, hb);
+    	q.finish();
+#endif
         std::chrono::high_resolution_clock::time_point p2pEnd = std::chrono::high_resolution_clock::now();
         cl_ulong p2pTime = std::chrono::duration_cast<std::chrono::microseconds>(p2pEnd - p2pStart).count();
-        ;
+
         double dnsduration = (double)p2pTime;
         double dsduration = dnsduration / ((double)1000000);
         double gbpersec = (iter * bufsize / dsduration) / ((double)1024 * 1024 * 1024);
         std::cout << "Buffer = " << size_str << " Iterations = " << iter << " Throughput = " << std::setprecision(2)
                   << std::fixed << gbpersec << "GB/s\n";
+	free(hb);
     }
     return 0;
 }
@@ -195,18 +169,7 @@ void ssd_to_host(int& nvmeFd,
 
     // Allocate Buffer in Global Memory
 
-    OCL_CHECK(err, cl::Buffer buffer_input(context, CL_MEM_READ_ONLY, vector_size_bytes, nullptr,
-                                           &err));
-
-    std::cout << "\nMap device buffers to host access pointers\n" << std::endl;
-    void* Ptr1 = q.enqueueMapBuffer(buffer_input,               // buffer
-                                       CL_TRUE,                    // blocking call
-                                       CL_MAP_READ | CL_MAP_WRITE, // Indicates we will be writing
-                                       0,                          // buffer offset
-                                       vector_size_bytes,          // size in bytes
-                                       nullptr, nullptr,
-                                       &err); // error code
-    q.finish();
+    OCL_CHECK(err, cl::Buffer buffer_input(context, CL_MEM_READ_WRITE, max_size, nullptr, &err));
 
     std::cout << "Start Read of various buffer sizes from device buffers to SSD\n" << std::endl;
     for (size_t bufsize = min_buffer; bufsize <= vector_size_bytes; bufsize *= 2) {
@@ -216,9 +179,21 @@ void ssd_to_host(int& nvmeFd,
         if (xcl::is_emulation()) {
             iter = 2; // Reducing iteration to run faster in emulation flow.
         }
+
+	char* hb = (char*)aligned_alloc(4096, max_size);
         std::chrono::high_resolution_clock::time_point p2pStart = std::chrono::high_resolution_clock::now();
+
+#if (MEM_COPY_ALL == 1)
+	q.enqueueReadBuffer(buffer_input, 0, 0, max_size, hb);
+	q.finish();
+#endif
         for (int i = 0; i < iter; i++) {
-            if (pwrite(nvmeFd, (void*)Ptr1, bufsize, 0) <= 0) {
+	    int offset = i * bufsize;
+#if (MEM_COPY_ALL == 0)
+	    q.enqueueReadBuffer(buffer_input, 0, offset, bufsize, hb + offset);
+	    q.finish();
+#endif
+            if (pwrite(nvmeFd, (void*) (hb + offset), bufsize, offset) <= 0) {
                 std::cerr << "ERR: pwrite failed: "
                           << " error: " << strerror(errno) << std::endl;
                 exit(EXIT_FAILURE);
@@ -226,7 +201,8 @@ void ssd_to_host(int& nvmeFd,
         }
         std::chrono::high_resolution_clock::time_point p2pEnd = std::chrono::high_resolution_clock::now();
         cl_ulong p2pTime = std::chrono::duration_cast<std::chrono::microseconds>(p2pEnd - p2pStart).count();
-        ;
+	free(hb);
+
         double dnsduration = (double)p2pTime;
         double dsduration = dnsduration / ((double)1000000);
         double gbpersec = (iter * bufsize / dsduration) / ((double)1024 * 1024 * 1024);
@@ -379,6 +355,7 @@ int main(int argc, char** argv) {
     
     int ret = 0;
     
+#if 1
     std::cout << "############################################################\n";
     std::cout << "                  P2P Test                       \n";
     std::cout << "############################################################\n";
@@ -394,6 +371,8 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
     std::cout << "INFO: Successfully opened NVME SSD " << filename << std::endl;
+    ret = p2p_host_to_ssd(nvmeFd, context, q, program, source_input_A);
+    ret = p2p_host_to_ssd(nvmeFd, context, q, program, source_input_A);
     ret = p2p_host_to_ssd(nvmeFd, context, q, program, source_input_A);
     (void)close(nvmeFd);
     if (ret != 0) return EXIT_FAILURE;
@@ -411,9 +390,11 @@ int main(int argc, char** argv) {
     std::cout << "INFO: Successfully opened NVME SSD " << filename << std::endl;
 
     p2p_ssd_to_host(nvmeFd, context, q, program, &source_input_A);
+    p2p_ssd_to_host(nvmeFd, context, q, program, &source_input_A);
+    p2p_ssd_to_host(nvmeFd, context, q, program, &source_input_A);
 
     (void)close(nvmeFd);
-    
+#endif
     std::cout << "############################################################\n";
     std::cout << "                  Not P2P Test                       \n";
     std::cout << "############################################################\n";
@@ -431,6 +412,9 @@ int main(int argc, char** argv) {
     std::cout << "INFO: Successfully opened NVME SSD " << filename << std::endl;
     ret = 0;
     ret = host_to_ssd(nvmeFd, context, q, program, source_input_A);
+    ret = host_to_ssd(nvmeFd, context, q, program, source_input_A);
+    ret = host_to_ssd(nvmeFd, context, q, program, source_input_A);
+    ret = host_to_ssd(nvmeFd, context, q, program, source_input_A);
     (void)close(nvmeFd);
     if (ret != 0) return EXIT_FAILURE;
 
@@ -446,6 +430,9 @@ int main(int argc, char** argv) {
     }
     std::cout << "INFO: Successfully opened NVME SSD " << filename << std::endl;
 
+    ssd_to_host(nvmeFd, context, q, program, &source_input_A);
+    ssd_to_host(nvmeFd, context, q, program, &source_input_A);
+    ssd_to_host(nvmeFd, context, q, program, &source_input_A);
     ssd_to_host(nvmeFd, context, q, program, &source_input_A);
 
     (void)close(nvmeFd);
