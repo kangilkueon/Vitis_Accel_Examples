@@ -49,11 +49,11 @@ include ./utils.mk
 TEMP_DIR := ./_x.$(TARGET).$(XSA)
 BUILD_DIR := ./build_dir.$(TARGET).$(XSA)
 
-LINK_OUTPUT := $(BUILD_DIR)/vector_addition.link.xclbin
+LINK_OUTPUT := $(BUILD_DIR)/bandwidth.link.xclbin
 PACKAGE_OUT = ./package.$(TARGET)
 
 VPP_PFLAGS := 
-CMD_ARGS = -x $(BUILD_DIR)/vector_addition.xclbin
+CMD_ARGS = -x $(BUILD_DIR)/bandwidth.xclbin
 CXXFLAGS += -I$(XILINX_XRT)/include -I$(XILINX_VIVADO)/include -Wall -O0 -g -std=c++1y
 LDFLAGS += -L$(XILINX_XRT)/lib -pthread -lOpenCL
 
@@ -79,26 +79,32 @@ EMCONFIG_DIR = $(TEMP_DIR)
 
 ############################## Setting Targets ##############################
 .PHONY: all clean cleanall docs emconfig
-all: check-platform check-device check-vitis $(EXECUTABLE) $(BUILD_DIR)/vector_addition.xclbin emconfig
+all: check-platform check-device check-vitis $(EXECUTABLE) $(BUILD_DIR)/bandwidth.xclbin emconfig
 
 .PHONY: host
 host: $(EXECUTABLE)
 
 .PHONY: build
-build: check-vitis check-device $(BUILD_DIR)/vector_addition.xclbin
+build: check-vitis check-device $(BUILD_DIR)/bandwidth.xclbin
 
 .PHONY: xclbin
 xclbin: build
 
 ############################## Setting Rules for Binary Containers (Building Kernels) ##############################
-$(TEMP_DIR)/vector_add.xo: src/vector_addition.cpp
+$(TEMP_DIR)/bandwidth.xo: src/bandwidth.cpp
 	mkdir -p $(TEMP_DIR)
-	v++ $(VPP_FLAGS) -c -k vector_add --temp_dir $(TEMP_DIR)  -I'$(<D)' -o'$@' '$<'
+	v++ $(VPP_FLAGS) -c -k bandwidth --temp_dir $(TEMP_DIR)  -I'$(<D)' -o'$@' '$<'
+$(TEMP_DIR)/read_bandwidth.xo: src/read_bandwidth.cpp
+	mkdir -p $(TEMP_DIR)
+	v++ $(VPP_FLAGS) -c -k read_bandwidth --temp_dir $(TEMP_DIR)  -I'$(<D)' -o'$@' '$<'
+$(TEMP_DIR)/write_bandwidth.xo: src/write_bandwidth.cpp
+	mkdir -p $(TEMP_DIR)
+	v++ $(VPP_FLAGS) -c -k write_bandwidth --temp_dir $(TEMP_DIR)  -I'$(<D)' -o'$@' '$<'
 
-$(BUILD_DIR)/vector_addition.xclbin: $(TEMP_DIR)/vector_add.xo
+$(BUILD_DIR)/bandwidth.xclbin: $(TEMP_DIR)/bandwidth.xo $(TEMP_DIR)/read_bandwidth.xo $(TEMP_DIR)/write_bandwidth.xo
 	mkdir -p $(BUILD_DIR)
 	v++ $(VPP_FLAGS) -l $(VPP_LDFLAGS) --temp_dir $(TEMP_DIR) -o'$(LINK_OUTPUT)' $(+)
-	v++ -p $(LINK_OUTPUT) $(VPP_FLAGS) --package.out_dir $(PACKAGE_OUT) -o $(BUILD_DIR)/vector_addition.xclbin
+	v++ -p $(LINK_OUTPUT) $(VPP_FLAGS) --package.out_dir $(PACKAGE_OUT) -o $(BUILD_DIR)/bandwidth.xclbin
 
 ############################## Setting Rules for Host (Building Host Executable) ##############################
 $(EXECUTABLE): $(HOST_SRCS) | check-xrt
