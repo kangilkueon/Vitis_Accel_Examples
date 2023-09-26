@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <fcntl.h>
 
+#include <omp.h>
+
 // XRT includes
 #include "experimental/xrt_bo.h"
 #include "experimental/xrt_device.h"
@@ -35,9 +37,19 @@
 #define MiB (1024 * 1024)
 #define GiB (1024 * 1024 * 1024)
 #define micro (1000 * 1000)
+
+#define HOST_TO_SSD                 (1)
+#define SSD_TO_HOST                 (1)
+#define FPGA_TO_SSD                 (1)
+#define SSD_TO_FPGA                 (1)
+#define HOST_TO_FPGA                (1)
+#define FPGA_TO_HOST                (1)
+
+static const int THREAD_COUNT = 16;
 static const int repeat = 5;
-static const int buf_count = 9;
-static size_t max_size = 64 * MiB; // 64 MB
+static const int buf_count = 18;
+// static size_t max_size = 1 * GiB;//64 * MiB;//1 * GiB;//64 * MiB; // 64 MB
+static size_t max_size = 512 * MiB;//1 * GiB;//64 * MiB; // 64 MB
 
 static const std::string error_message =
     "Error: Result mismatch:\n"
@@ -46,6 +58,8 @@ static const std::string error_message =
 // This example illustrates the simple OpenCL example that performs
 // buffer copy from one buffer to another
 int main(int argc, char** argv) {
+    omp_set_num_threads(THREAD_COUNT);
+
     // Command Line Parser
     sda::utils::CmdLineParser parser;
 
@@ -66,7 +80,7 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    int buf_size[buf_count] = {4, 8, 16, 32, 64, 128, 256, 512, 1024};
+    int buf_size[buf_count] = {4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288};
     char* input_data = (char*) aligned_alloc(4096, max_size);
     char* output_data = (char*) aligned_alloc(4096, max_size);
 
@@ -85,18 +99,21 @@ int main(int argc, char** argv) {
     std::chrono::high_resolution_clock::time_point start_time = std::chrono::high_resolution_clock::now();
     std::chrono::high_resolution_clock::time_point end_time = std::chrono::high_resolution_clock::now();
     uint64_t process_time = 0;
+#if (HOST_TO_SSD == 1)
     printf("Write Performance (Host to SSD)\n");
     for (int i = 0; i < buf_count; i++) {
         nvmeFd = open(filename.c_str(), O_RDWR | O_DIRECT);
         int size = buf_size[i] * KiB;
         int iter = max_size / size;
         start_time = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel
+        #pragma omp for
         for (int _repeat = 0; _repeat < repeat; _repeat++) {
             for (int j = 0; j < iter; j++) {
                 int ret = pwrite(nvmeFd, (void*)(input_data + size * j), size, size * j);
                 if (ret == -1) {
                     std::cout << "[Fail] SSD Write Performance Fails" << __LINE__ << " " << j << " " << ret << std::endl;
-                    return EXIT_FAILURE;
+                    break;
                 }
             }
             sync();
@@ -108,7 +125,9 @@ int main(int argc, char** argv) {
         printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
         close(nvmeFd);
     }
+#endif
     
+#if (SSD_TO_HOST == 1)
     printf("Read Performance (SSD to Host)\n");
     for (int i = 0; i < buf_count; i++) {
         nvmeFd = open(filename.c_str(), O_RDWR | O_DIRECT);
@@ -116,12 +135,14 @@ int main(int argc, char** argv) {
         int iter = max_size / size;
         
         start_time = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel
+        #pragma omp for
         for (int _repeat = 0; _repeat < repeat; _repeat++) {
             for (int j = 0; j < iter; j++) {
                 int ret = pread(nvmeFd, (void*)(output_data + size * j), size, size * j);
                 if (ret == -1) {
                     std::cout << "[Fail] SSD Read Performance Fails" << __LINE__ << " " << j << " " << ret << std::endl;
-                    return EXIT_FAILURE;
+                    break;
                 }
             }
         }
@@ -141,6 +162,7 @@ int main(int argc, char** argv) {
         printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
         close(nvmeFd);
     }
+#endif
 
     // FPGA Init
     int device_index = stoi(parser.value("device_id"));
@@ -150,27 +172,37 @@ int main(int argc, char** argv) {
     std::cout << "############################################################\n";
     std::cout << "                  P2P Performance\n";
     std::cout << "############################################################\n";
-    xrt::bo::flags flags = xrt::bo::flags::p2p;
 
+    xrt::bo::flags flags = xrt::bo::flags::normal;
     auto krnl = xrt::kernel(device, uuid, "read_bandwidth");
-    auto p2p_bo1 = xrt::bo(device, max_size, flags, krnl.group_id(0));
-    auto p2p_bo1_map = p2p_bo1.map<char*>();
-    memcpy(p2p_bo1_map, input_data, max_size);
+    auto bo_in = xrt::bo(device, max_size, flags, krnl.group_id(0));
+    auto bo_out = xrt::bo(device, max_size, flags, krnl.group_id(0));
+    
+#if (FPGA_TO_SSD == 1 || SSD_TO_FPGA == 1)
+    flags = xrt::bo::flags::p2p;
 
+    auto bo_p2p = xrt::bo(device, max_size, flags, krnl.group_id(0));
+    auto p2p_host = bo_p2p.map<char*>();
+    memcpy(p2p_host, input_data, max_size);
+#endif
+
+#if (FPGA_TO_SSD == 1)
     printf("Write Performance (FPGA to SSD)\n");
     for (int i = 0; i < buf_count; i++) {
         nvmeFd = open(filename.c_str(), O_RDWR | O_DIRECT);
         int size = buf_size[i] * KiB;
         int iter = max_size / size;
         start_time = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel
+        #pragma omp for
         for (int _repeat = 0; _repeat < repeat; _repeat++) {
             for (int j = 0; j < iter; j++) {
                 // printf("%d",j);
-                int ret = pwrite(nvmeFd, (void*)(p2p_bo1_map + size * j), size, size * j);
+                int ret = pwrite(nvmeFd, (void*)(p2p_host + size * j), size, size * j);
                 if (ret == -1) {
                     std::cout << "[Fail] SSD Write Performance Fails " << __LINE__ << " " << i << " " << ret << std::endl;
                     std::cout << "[Fail] SSD Write Performance Fails " << __LINE__ << " " << j << " " << size << std::endl;
-                    return EXIT_FAILURE;
+                    break;
                 }
             }
             sync();
@@ -182,9 +214,11 @@ int main(int argc, char** argv) {
         printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
         close(nvmeFd);
     }
-    
+#endif
+
+#if (SSD_TO_FPGA == 1)
     printf("Read Performance (SSD to FPGA)\n");
-    std::fill(p2p_bo1_map, p2p_bo1_map + max_size, 0);
+    std::fill(p2p_host, p2p_host + max_size, 0);
     
     for (int i = 0; i < buf_count; i++) {
         nvmeFd = open(filename.c_str(), O_RDWR | O_DIRECT);
@@ -192,12 +226,14 @@ int main(int argc, char** argv) {
         int iter = max_size / size;
         
         start_time = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel
+        #pragma omp for
         for (int _repeat = 0; _repeat < repeat; _repeat++) {
             for (int j = 0; j < iter; j++) {
-                int ret = pread(nvmeFd, (void*)(p2p_bo1_map + size * j), size, size * j);
+                int ret = pread(nvmeFd, (void*)(p2p_host + size * j), size, size * j);
                 if (ret == -1) {
                     std::cout << "[Fail] SSD Read Performance Fails" << __LINE__ << " " << j << " " << ret << std::endl;
-                    return EXIT_FAILURE;
+                    break;
                 }
             }
         }
@@ -217,23 +253,28 @@ int main(int argc, char** argv) {
         printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
         close(nvmeFd);
     }
-
+#endif
     std::cout << "############################################################\n";
     std::cout << "                  FPGA Performance " << uuid << "\n";
     std::cout << "############################################################\n";
 
+#if (HOST_TO_FPGA == 1)
     printf("Write Performance (Host to FPGA (by bo::write))\n");
     for (int i = 0; i < buf_count; i++) {
         auto krnl = xrt::kernel(device, uuid, "bandwidth");
         int size = buf_size[i] * KiB;
         int iter = max_size / size;
         
-        auto bo_a = xrt::bo(device, size, krnl.group_id(0));
+        // auto bo_a = xrt::bo(device, size, krnl.group_id(0));
         start_time = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel
+        #pragma omp for
         for (int _repeat = 0; _repeat < repeat; _repeat++) {
             for (int j = 0; j < iter; j++) {
-                bo_a.write((void*)input_data, size, 0);
-                bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);    
+                int offset = j * size;
+
+                bo_in.write((void*)input_data, size, offset);
+                bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE, size, offset);   
             }
         }
         end_time = std::chrono::high_resolution_clock::now();
@@ -242,180 +283,64 @@ int main(int argc, char** argv) {
         double avg_latency = process_time / iter / repeat;
         printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
     }
+#endif
 
+#if (FPGA_TO_HOST == 1)
+#define Simple_CHECK (0)
     printf("Read Performance (FPGA to Host (by bo::read))\n");
     for (int i = 0; i < buf_count; i++) {
         auto krnl = xrt::kernel(device, uuid, "bandwidth");
-        int size = buf_size[i] * KiB;
-        int iter = max_size / size;
+        int64_t size = buf_size[i] * KiB;
+        int64_t iter = max_size / size;
         
-        auto bo_b = xrt::bo(device, size, krnl.group_id(0));
-        char* test = (char *) aligned_alloc(4096, size);
-        std::fill(test, test + size, 0);
+        std::fill(output_data, output_data + size, 0);
+        auto run = krnl(bo_in, bo_out, max_size / sizeof(int));
+        run.wait();
+
         start_time = std::chrono::high_resolution_clock::now();
+        #pragma omp parallel
+        #pragma omp for
         for (int _repeat = 0; _repeat < repeat; _repeat++) {
             for (int j = 0; j < iter; j++) {
-                bo_b.read((void*)test, size, 0);
-                bo_b.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            }
-        }
-        end_time = std::chrono::high_resolution_clock::now();
-        process_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        
-#if (DATA_CORRUPTION_CHECK == 1)
-        for (size_t idx = 0; idx < size; idx++)
-        {
-            if (input_data[idx] != output_data[idx])
-            {
-                printf("Data corruption[%dth] : %c\n", idx, test[idx]);
-            }
-        }
+                int offset = j * size;
+#if (Simple_CHECK || DATA_CORRUPTION_CHECK == 1)
+                bo_out.write(input_data, size, offset);
+                bo_out.sync(XCL_BO_SYNC_BO_TO_DEVICE, size, offset);
 #endif
-        free(test);
-        int64_t bandwidth = max_size * repeat / process_time;
-        double avg_latency = process_time / iter / repeat;
-        printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
-    }
-
-    printf("Write Performance (Host to FPGA (by mapped))\n");
-    for (int i = 0; i < buf_count; i++) {
-        auto krnl = xrt::kernel(device, uuid, "bandwidth");
-        int size = buf_size[i] * KiB;
-        int iter = max_size / size;
-        
-        auto bo_b = xrt::bo(device, size, krnl.group_id(0));
-        auto bo_b_map = bo_b.map<char*>();
-        std::fill(bo_b_map, bo_b_map + size, 1);
-
-        start_time = std::chrono::high_resolution_clock::now();
-        for (int _repeat = 0; _repeat < repeat; _repeat++) {
-            for (int j = 0; j < iter; j++) {
-                memcpy(bo_b_map, input_data + size * j, size);
-                bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                // auto run = krnl(bo_host, bo_device, size);
+                // auto run = krnl(bo_test, bo_test, size);
+                // run.wait();
+#if 0
+                auto input_buffer_mapped = bo_out.map<int*>();
+                bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE, size, offset);
+#else
+                bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE, size, offset);
+                // bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                bo_out.read((void*) output_data, size, offset);
+#endif
+#if (Simple_CHECK || DATA_CORRUPTION_CHECK == 1)
+                for (size_t idx = 0; idx < size / sizeof(char *); idx++)
+                {
+                    if (input_data[idx] != output_data[idx])
+                    // if (idx < 100)
+                    {
+                        printf("Data corruption[%dth] : %c vs %c\n", idx, input_data[idx], output_data[idx]);
+                    }
+                }
+#endif
             }
+                //bo_b.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                //printf("hello3?\n");
         }
         end_time = std::chrono::high_resolution_clock::now();
         process_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        int64_t bandwidth = max_size * repeat / process_time;
+        int64_t bandwidth = size * iter * repeat / process_time;
         double avg_latency = process_time / iter / repeat;
-        printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
-        //free(bo_a_map);
-        //free((void*) bo_a);
+        printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us (iter:%u)\n", size, bandwidth, avg_latency, process_time, iter);
     }
-    printf("Read Performance (FPGA to Host (by mapped))\n");
-    for (int i = 0; i < buf_count; i++) {
-        auto krnl = xrt::kernel(device, uuid, "bandwidth");
-        int size = buf_size[i] * KiB;
-        int iter = max_size / size;
-        
-        auto bo_b = xrt::bo(device, size, krnl.group_id(0));
-        auto bo_b_map = bo_b.map<char*>();
-        std::fill(bo_b_map, bo_b_map + size, 0);
-        
-        char* test = (char *) aligned_alloc(4096, size);
-        start_time = std::chrono::high_resolution_clock::now();
-        for (int _repeat = 0; _repeat < repeat; _repeat++)
-        {
-            for (int j = 0; j < iter; j++) {
-                bo_b.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                memcpy(test, bo_b_map, size);
-            }
-        }
-        end_time = std::chrono::high_resolution_clock::now();
-        process_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        int64_t bandwidth = max_size * repeat / process_time;
-        double avg_latency = process_time / iter / repeat;
-        printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
-
-    }
-
-    printf("Write Performance (Host to Host (by kernel))\n");
-    for (int i = 0; i < buf_count; i++) {
-        auto krnl = xrt::kernel(device, uuid, "bandwidth");
-        int size = buf_size[i] * KiB;
-        int iter = max_size / size;
-        
-        auto bo_a = xrt::bo(device, max_size, krnl.group_id(0));
-        auto bo_b = xrt::bo(device, size, krnl.group_id(0));
-        auto bo_a_map = bo_a.map<char*>();
-        auto bo_b_map = bo_b.map<char*>();
-
-        memcpy(bo_a_map, input_data, size);
-        std::fill(bo_b_map, bo_b_map + size, 0);
-
-        start_time = std::chrono::high_resolution_clock::now();
-        for (int _repeat = 0; _repeat < repeat; _repeat++) {
-            for (int j = 0; j < iter; j++) {
-                bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                auto run = krnl(bo_a, bo_b, size);
-                run.wait();
-                bo_b.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            }
-        }
-        end_time = std::chrono::high_resolution_clock::now();
-        process_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-
-        int64_t bandwidth = max_size * repeat / process_time;
-        double avg_latency = process_time / iter / repeat;
-        printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
-        //free(bo_a_map);
-        //free((void*) bo_a);
-    }
-
-    printf("Write Performance (Host to FPGA (by kernel))\n");
-    for (int i = 0; i < buf_count; i++) {
-        auto krnl = xrt::kernel(device, uuid, "write_bandwidth");
-        int size = buf_size[i] * KiB;
-        int iter = max_size / size;
-        
-        auto bo_a = xrt::bo(device, max_size, krnl.group_id(0));
-        auto bo_b = xrt::bo(device, size, krnl.group_id(0));
-        auto bo_a_map = bo_a.map<char*>();
-        for (int i = 0; i < size; i++) bo_a_map[i] = 0xc;
-        auto bo_b_map = bo_b.map<char*>();
-        std::fill(bo_b_map, bo_b_map + size, 1);
-
-        start_time = std::chrono::high_resolution_clock::now();
-        for (int _repeat = 0; _repeat < repeat; _repeat++)
-            for (int j = 0; j < iter; j++) {
-                bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                auto run = krnl(bo_a, size);
-                run.wait();
-            }
-        end_time = std::chrono::high_resolution_clock::now();
-        process_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        int64_t bandwidth = max_size * repeat / process_time;
-        double avg_latency = process_time / iter / repeat;
-        printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
-        //free(bo_a_map);
-        //free((void*) bo_a);
-    }
-
-    printf("Read Performance (FPGA to Host (by kernel))\n");
-    for (int i = 0; i < buf_count; i++) {
-        auto krnl = xrt::kernel(device, uuid, "read_bandwidth");
-        int size = buf_size[i] * KiB;
-        int iter = max_size / size;
-        
-        auto bo_a = xrt::bo(device, max_size, krnl.group_id(0));
-        auto bo_a_map = bo_a.map<int*>();
-        for (int i = 0; i < size; i++) bo_a_map[i] = 0xc;
-        
-        start_time = std::chrono::high_resolution_clock::now();
-        for (int _repeat = 0; _repeat < repeat; _repeat++)
-            for (int j = 0; j < iter; j++) {
-                bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                auto run = krnl(bo_a, size);
-                run.wait();
-                bo_a.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            }
-        end_time = std::chrono::high_resolution_clock::now();
-        process_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-        int64_t bandwidth = max_size * repeat / process_time;
-        double avg_latency = process_time / iter / repeat;
-        printf("IO_Size : %d B\tBandwidth : %ld MB/s\tavg_latench : %f us\ttotal_time:%lu us\n", size, bandwidth, avg_latency, process_time);
-    }
+#endif
 
     free(input_data);
+    free(output_data);
     return 0;
 }
